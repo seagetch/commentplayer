@@ -5,7 +5,7 @@ from PySide2.QtMultimedia import QMediaContent, QMediaPlayer
 from PySide2.QtMultimediaWidgets import QVideoWidget
 from PySide2.QtWidgets import (QApplication, QSlider, QVBoxLayout, QWidget,
                                QTextEdit, QTableWidget, QTableWidgetItem, QHBoxLayout, QLabel, QPushButton,
-                               QToolButton, QAbstractItemView)
+                               QToolButton, QAbstractItemView, QLineEdit)
 from PySide2.QtWidgets import QSizePolicy
 
 import requests, threading
@@ -23,11 +23,10 @@ import os
 # Global variable for the hostname of the VOICEVOX server
 VOICEVOX_SERVER = "http://localhost:50021"
 
-# ヘルパ関数：　アルファベットをカタカナに変更
+# Helper function: Convert alphabet to Katakana
 # https://qiita.com/kunishou/items/814e837cf504ce287a13
-
 def alpha_to_kana(text):
-    #半角英字判定
+    # Check if string is alphabetic
     alphaReg = re.compile(r'^[a-zA-Z]+$')
     def isalpha(s):
         return alphaReg.match(s) is not None
@@ -36,7 +35,6 @@ def alpha_to_kana(text):
 
     wakati = MeCab.Tagger('-Owakati')
     wakati_result = wakati.parse(sample_txt)
-    #print(wakati_result)
 
     df = pd.DataFrame(wakati_result.split(" "),columns=["word"])
     df = df[df["word"].str.isalpha() == True]
@@ -104,6 +102,10 @@ class VideoPlayer(QWidget):
         commentLayout.addWidget(QLabel("Comment:"))
         commentLayout.addWidget(self.loadingLabel)
         commentLayout.addWidget(self.editPositionLabel)
+        self.editOffset = QLineEdit()  # CHANGE HERE
+        self.editOffset.hide()  # CHANGE HERE
+        self.editOffset.returnPressed.connect(self.updateOffset)  # CHANGE HERE
+        commentLayout.addWidget(self.editOffset)  # CHANGE HERE
         commentLayout.addWidget(self.commentEdit)
 
         layout = QHBoxLayout()
@@ -132,6 +134,7 @@ class VideoPlayer(QWidget):
         self.commentsTable.horizontalHeader().setStretchLastSection(True)
         self.commentsTable.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.commentsTable.setColumnWidth(0, 32)  # set the width of the first column to 50
+        self.commentsTable.clicked.connect(self.selectComment)  # CHANGE HERE
 
         self.mediaPlayer.setMedia(QMediaContent(QUrl.fromLocalFile(filename)))
 
@@ -181,7 +184,6 @@ class VideoPlayer(QWidget):
             if position < offset:
                 self.nextCommentIndex = i
                 break
-                
 
     def commentTextChanged(self):
         comment = self.commentEdit.toPlainText()
@@ -202,12 +204,22 @@ class VideoPlayer(QWidget):
             self.currentPosition = self.mediaPlayer.position()
             self.loadingLabel.setPixmap(self.loadingIcon.pixmap(16, 16))
             self.editPositionLabel.setText(self.formatTime(self.currentPosition))
+            self.editPositionLabel.mousePressEvent = self.showOffsetInput  # CHANGE HERE
 
-    def addComment(self, comment, currentPosition = None):
+    def addComment(self, comment, currentPosition=None):
         if currentPosition is None:
             currentPosition = self.currentPosition
 
         if currentPosition is not None:
+            row = self.findCommentByPosition(currentPosition)  # Find the comment at the same position
+            if row is not None:  # If the comment exists, update it instead of adding a new one
+                self.updateComment(row, comment)
+                self.commentEdit.clear()
+                self.currentPosition = None
+                self.loadingLabel.clear()
+                self.editPositionLabel.clear()
+                return  # Skip the code for adding a new comment
+
             new_comment = (currentPosition, comment)
 
             row = 0
@@ -312,6 +324,43 @@ class VideoPlayer(QWidget):
         
         # Delete the temporary file after playing
         os.unlink(temp_file.name)
+
+    def selectComment(self, index):  # CHANGE HERE
+        row = index.row()
+        offset, comment = self.comments[row]
+        self.currentPosition = offset
+        self.commentEdit.setText(comment)
+        self.editPositionLabel.setText(self.formatTime(offset))
+
+    def findCommentByPosition(self, position):  # CHANGE HERE
+        for i, (offset, _) in enumerate(self.comments):
+            if offset == position:
+                return i
+        return None
+
+    def updateComment(self, row, comment):  # CHANGE HERE
+        self.comments[row] = (self.comments[row][0], comment)
+        self.commentsTable.cellWidget(row, 2).children()[1].setText(comment)
+
+    def showOffsetInput(self, event):  # CHANGE HERE
+        self.editOffset.setText(self.editPositionLabel.text())
+        self.editOffset.selectAll()
+        self.editOffset.show()
+        self.editOffset.setFocus()
+
+    def updateOffset(self):  # CHANGE HERE
+        newOffset = self.timeToMs(self.editOffset.text())
+        row = self.findCommentByPosition(self.currentPosition)
+        if row is not None:
+            self.comments[row] = (newOffset, self.comments[row][1])
+            self.commentsTable.item(row, 1).setText(self.formatTime(newOffset))
+        self.currentPosition = newOffset
+        self.editPositionLabel.setText(self.formatTime(newOffset))
+        self.editOffset.hide()
+
+    def timeToMs(self, timeStr):  # CHANGE HERE
+        h, m, s = map(float, timeStr.split(":"))
+        return int((h * 60 * 60 + m * 60 + s) * 1000)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
