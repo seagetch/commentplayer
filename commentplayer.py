@@ -19,6 +19,9 @@ import pandas as pd
 import alkana
 import re
 import os
+import tqdm
+from pydub import AudioSegment
+import io, wave
 
 # Global variable for the hostname of the VOICEVOX server
 VOICEVOX_SERVER = "http://localhost:50021"
@@ -63,7 +66,7 @@ class IMETextEdit(QTextEdit):
         super().keyPressEvent(event)
 
 class VideoPlayer(QWidget):
-    def __init__(self, filename, parent=None):
+    def __init__(self, filename, parent=None, playbackRate = 1.0, audioSpeedScale = 1.0):
         super(VideoPlayer, self).__init__(parent)
 
         self.filename = filename
@@ -80,6 +83,7 @@ class VideoPlayer(QWidget):
         self.editPositionLabel = QLabel()
         self.saveButton = QPushButton("Save")
         self.loadButton = QPushButton("Load")
+        self.generateWavButton = QPushButton("export WAV")
         
         self.commentOverlay = QLabel()
         self.commentOverlay.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
@@ -98,6 +102,7 @@ class VideoPlayer(QWidget):
         buttonLayout = QHBoxLayout();
         buttonLayout.addWidget(self.saveButton)
         buttonLayout.addWidget(self.loadButton)
+        buttonLayout.addWidget(self.generateWavButton)
         commentLayout.addLayout(buttonLayout)
         commentLayout.addWidget(QLabel("Comment:"))
         commentLayout.addWidget(self.loadingLabel)
@@ -123,10 +128,13 @@ class VideoPlayer(QWidget):
         self.slider.sliderMoved.connect(self.setPosition)
         self.commentEdit.textChanged.connect(self.commentTextChanged)
         self.commentEdit.editingStarted.connect(self.startEditing)
+        self.editPositionLabel.mousePressEvent = self.showOffsetInput  # CHANGE HERE
         self.playButton.clicked.connect(self.changeMediaState)
+        self.commentsTable.itemChanged.connect(self.tableItemChanged)
 
         self.saveButton.clicked.connect(self.saveComments)
         self.loadButton.clicked.connect(self.loadComments)
+        self.generateWavButton.clicked.connect(self.generateWav)
 
         self.playButton.setIcon(qta.icon('fa5s.play'))
 
@@ -137,16 +145,18 @@ class VideoPlayer(QWidget):
         self.commentsTable.clicked.connect(self.selectComment)  # CHANGE HERE
 
         self.mediaPlayer.setMedia(QMediaContent(QUrl.fromLocalFile(filename)))
+        self.setPlaybackRate(playbackRate)
+        self.audioSpeedScale = audioSpeedRate
 
         # Timer for updating the current position label
         self.timer = QTimer()
-        self.timer.setInterval(1000)
+        self.timer.setInterval(1000 / playbackRate)
         self.timer.timeout.connect(self.updatePositionLabel)
         self.timer.start()
 
         # Timer for updating comment overlay every second
         self.overlayTimer = QTimer()
-        self.overlayTimer.setInterval(1000)
+        self.overlayTimer.setInterval(1000  / playbackRate)
         self.overlayTimer.timeout.connect(self.updateOverlay)
         self.overlayTimer.start()
 
@@ -156,6 +166,29 @@ class VideoPlayer(QWidget):
         self.loadingIcon = qta.icon('fa.spinner', color='red', animation=qta.Spin(self.commentEdit))
 
         self.loadComments()
+    
+    def tableItemChanged(self, item):
+        # item is the QTableWidgetItem that was changed
+        # We only care about the offset column, which is column 1
+        if item.column() == 1:
+            row = item.row()
+            # Convert the text from the QTableWidgetItem to milliseconds
+            newOffset = self.timeToMs(item.text())
+            # Update self.comments
+            oldOffset, comment = self.comments[row]
+            self.comments[row] = (newOffset, comment)
+
+    def setComment(self, row, offset, comment):
+        if row < len(self.comments):
+            self.comments[row] = (offset, comment)
+            self.commentsTable.item(row, 1).setText(self.formatTime(offset))
+            self.commentsTable.cellWidget(row, 2).children()[1].setText(comment)
+        else:
+            # Handle the error when the row is out of range.
+            pass
+    
+    def setPlaybackRate(self, rate):
+        self.mediaPlayer.setPlaybackRate(rate)
 
     def changeMediaState(self):
         if self.mediaPlayer.state() == QMediaPlayer.PlayingState:
@@ -179,6 +212,7 @@ class VideoPlayer(QWidget):
         self.slider.setRange(0, duration)
 
     def setPosition(self, position):
+        self.voicePlayer.pause()
         self.mediaPlayer.setPosition(position)
         for i, (offset, comment) in enumerate(self.comments):
             if position < offset:
@@ -204,7 +238,19 @@ class VideoPlayer(QWidget):
             self.currentPosition = self.mediaPlayer.position()
             self.loadingLabel.setPixmap(self.loadingIcon.pixmap(16, 16))
             self.editPositionLabel.setText(self.formatTime(self.currentPosition))
-            self.editPositionLabel.mousePressEvent = self.showOffsetInput  # CHANGE HERE
+
+    def removeComment(self, row):
+        def _remove():
+            # Get the row from the clicked button
+            row = self.commentsTable.indexAt(btn.pos()).row()
+            del self.comments[row]
+            self.commentsTable.removeRow(row)
+
+        btn = QToolButton()
+        btn.setIcon(qta.icon('fa5s.trash-alt'))  # Set a delete icon using the qtawesome library
+        btn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Maximum)
+        btn.clicked.connect(_remove)
+        return btn
 
     def addComment(self, comment, currentPosition=None):
         if currentPosition is None:
@@ -240,21 +286,12 @@ class VideoPlayer(QWidget):
             commentWidget.setLayout(commentLayout)
 
             self.commentsTable.setCellWidget(row, 2, commentWidget)
-            btn = QToolButton()
-            btn.setIcon(qta.icon('fa5s.trash-alt'))  # Set a delete icon using the qtawesome library
-            btn.setSizePolicy(QSizePolicy.Maximum, QSizePolicy.Maximum)
-            btn.clicked.connect(self.removeComment(row))
+            btn = self.removeComment(row)
             self.commentsTable.setCellWidget(row, 0, btn)
 
             self.currentPosition = None  # Reset the remembered position after adding the comment
             self.loadingLabel.clear()
             self.editPositionLabel.clear()
-
-    def removeComment(self, row):
-        def _remove():
-            del self.comments[row]
-            self.commentsTable.removeRow(row)
-        return _remove
 
     def play(self):
         self.mediaPlayer.play()
@@ -276,15 +313,15 @@ class VideoPlayer(QWidget):
                 self.commentOverlay.setText(comment)
                 threading.Thread(target=self.play_speech, args=(comment, 0)).start()
                 self.nextCommentIndex += 1
-        else:
-            self.commentOverlay.clear()
+#        else:
+#            self.commentOverlay.clear()
 
     def saveComments(self):
         self.save(self.filename+".comments.json");
 
     def save(self, filename):
         with open(filename, "w", encoding="utf-8") as f:
-            json.dump(self.comments, f, ensure_ascii=False)
+            json.dump(self.comments, f, ensure_ascii=False, indent=2)
     
     def loadComments(self):
         self.load(self.filename+".comments.json")
@@ -302,10 +339,15 @@ class VideoPlayer(QWidget):
         except FileNotFoundError as e:
             pass
 
+    def generateWav(self):
+        threading.Thread(target=self.generate_wav, args=(0,)).start()
+
     def play_speech(self, text, speaker=0):
         text = alpha_to_kana(text)
         res1 = requests.post("http://localhost:50021/audio_query", params={"text": text, "speaker": speaker})
         data = res1.json()
+        if "speedScale" in data:
+            data["speedScale"] *= audioSpeedRate
         wav_res = requests.post("http://localhost:50021/synthesis", params={"speaker": speaker}, json=data)
         wav_data = wav_res.content
 
@@ -318,7 +360,8 @@ class VideoPlayer(QWidget):
         temp_file.close()
 
         # Play the temporary file
-        self.voicePlayer = QMediaPlayer()
+        if self.voicePlayer is None:
+            self.voicePlayer = QMediaPlayer()
         self.voicePlayer.setMedia(QMediaContent(QUrl.fromLocalFile(temp_file.name)))
         self.voicePlayer.play()
         
@@ -331,6 +374,7 @@ class VideoPlayer(QWidget):
         self.currentPosition = offset
         self.commentEdit.setText(comment)
         self.editPositionLabel.setText(self.formatTime(offset))
+        self.setPosition(offset - 2000)
 
     def findCommentByPosition(self, position):  # CHANGE HERE
         for i, (offset, _) in enumerate(self.comments):
@@ -346,21 +390,53 @@ class VideoPlayer(QWidget):
         self.editOffset.setText(self.editPositionLabel.text())
         self.editOffset.selectAll()
         self.editOffset.show()
+        self.editPositionLabel.hide()
         self.editOffset.setFocus()
 
     def updateOffset(self):  # CHANGE HERE
         newOffset = self.timeToMs(self.editOffset.text())
         row = self.findCommentByPosition(self.currentPosition)
         if row is not None:
-            self.comments[row] = (newOffset, self.comments[row][1])
-            self.commentsTable.item(row, 1).setText(self.formatTime(newOffset))
+            self.setComment(row, newOffset, self.comments[row][1])
         self.currentPosition = newOffset
         self.editPositionLabel.setText(self.formatTime(newOffset))
         self.editOffset.hide()
+        self.editPositionLabel.show()
 
     def timeToMs(self, timeStr):  # CHANGE HERE
         h, m, s = map(float, timeStr.split(":"))
         return int((h * 60 * 60 + m * 60 + s) * 1000)
+
+    def generate_wav(self, speaker = 0):
+        # Create an empty audio track of silence for mixdown
+        mixdown_audio = AudioSegment.silent(duration=0)
+
+        # Iterate over the sorted comments
+        for comment in tqdm.tqdm(sorted(self.comments, key=lambda x: x[0])):
+            text = comment[1]
+            text = alpha_to_kana(text)
+            res1 = requests.post("http://localhost:50021/audio_query", params={"text": text, "speaker": speaker})
+            data = res1.json()
+            if "speedScale" in data:
+                data["speedScale"] *= self.audioSpeedScale
+            wav_res = requests.post("http://localhost:50021/synthesis", params={"speaker": speaker}, json=data)
+            wav_data = wav_res.content
+            
+            # Load the wav_data into an AudioSegment
+            audio_segment = AudioSegment.from_wav(io.BytesIO(wav_data))
+            
+            # If the audio_segment is shorter than the comment[0] offset, pad it with silence
+            audio_duration_ms = len(audio_segment)
+            silence_duration_ms = max(0, comment[0] - len(mixdown_audio))
+            silence = AudioSegment.silent(duration=silence_duration_ms)
+            
+            # Append silence and audio_segment to mixdown_audio
+            mixdown_audio += silence
+            mixdown_audio += audio_segment
+
+        # Export the mixdown_audio to a .wav file
+        output_filename = self.filename + ".comments.wav"
+        mixdown_audio.export(output_filename, format="wav")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -371,7 +447,11 @@ if __name__ == "__main__":
 
     app = QApplication(sys.argv)
 
-    player = VideoPlayer(filename)
+    playbackRate = float(sys.argv[2]) if len(sys.argv) >= 3 else 1
+    audioSpeedRate = float(sys.argv[3]) if len(sys.argv) >= 4 else 1
+    
+    player = VideoPlayer(filename, playbackRate = playbackRate, audioSpeedScale = audioSpeedRate)
+
     player.showMaximized()
     player.play()
 
