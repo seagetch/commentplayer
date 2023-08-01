@@ -228,15 +228,6 @@ def main():
         output_filename = video_filename[:-4] + "_final.mp4"
         generate_video(comments, video_filename, audio_comments_filename, output_filename)
 
-        # Overlay text comments on video
-#        video_clips = overlay_text_comments(video_filename, comments)
-#        final_video = CompositeVideoClip(video_clips)
-#        text_overlay_video_filename = video_filename[:-4] + "_text_overlay.mp4"
-#        final_video.write_videofile(text_overlay_video_filename, codec='libx264')
-
-        # Combine video with overlay text and audio comments
-#        add_audio_comments(text_overlay_video_filename, audio_comments_filename, output_filename)
-
 if __name__ == "__main__":
     main()
 
