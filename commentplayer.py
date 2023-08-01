@@ -70,6 +70,8 @@ class VideoPlayer(QWidget):
         super(VideoPlayer, self).__init__(parent)
 
         self.filename = filename
+        self.playbackRate = playbackRate
+        self.playbackScale = 1.0
 
         self.mediaPlayer = QMediaPlayer(None, QMediaPlayer.VideoSurface)
         self.voicePlayer = QMediaPlayer()
@@ -166,7 +168,10 @@ class VideoPlayer(QWidget):
         self.loadingIcon = qta.icon('fa.spinner', color='red', animation=qta.Spin(self.commentEdit))
 
         self.loadComments()
-    
+        self.updateTimer()  # Initialize the timer for the first comment
+        self.setPlaybackRate(playbackRate)
+
+
     def tableItemChanged(self, item):
         # item is the QTableWidgetItem that was changed
         # We only care about the offset column, which is column 1
@@ -186,6 +191,7 @@ class VideoPlayer(QWidget):
         else:
             # Handle the error when the row is out of range.
             pass
+        self.updateTimer()  # Update the timer based on the new position
     
     def setPlaybackRate(self, rate):
         self.mediaPlayer.setPlaybackRate(rate)
@@ -211,13 +217,55 @@ class VideoPlayer(QWidget):
     def durationChanged(self, duration):
         self.slider.setRange(0, duration)
 
+    def findPlaybackSpeedByOffset(self, start_index):
+        for i in range(start_index - 1, -1, -1):
+            offset, comment = self.comments[i]
+            fast_forward_match = re.match(r'^>+(\n)*$', comment)
+            slow_down_match = re.match(r'^<+(\n)*$', comment)
+            if fast_forward_match:
+                multiplier = len(fast_forward_match.group(0).replace('\n', ''))
+                return multiplier
+            elif slow_down_match:
+                divider = len(slow_down_match.group(0).replace('\n', ''))
+                return 1.0 / divider
+        return 1  # Default value if no matching offset is found
+
     def setPosition(self, position):
+        # Find if the position is in a skipped zone and get the corresponding end offset
+        for i, (offset, comment) in enumerate(self.comments):
+            if comment == "[":
+                end_skip_index = self.findEndSkipIndex(i + 1)
+                if end_skip_index is not None:
+                    end_offset = self.comments[end_skip_index][0]
+                    if offset <= position < end_offset:
+                        # If the position is in a skipped zone, set to the end of that zone
+                        position = end_offset
+                        break
         self.voicePlayer.pause()
         self.mediaPlayer.setPosition(position)
         for i, (offset, comment) in enumerate(self.comments):
             if position < offset:
                 self.nextCommentIndex = i
                 break
+        # Find the playback speed for the current offset
+        playback_speed = self.findPlaybackSpeedByOffset(self.nextCommentIndex)
+        self.playbackScale = playback_speed
+        
+        # Update the playback rate if a valid speed was found
+        print("playbackScale=%f,%f"%(self.playbackScale, self.playbackRate))
+        self.setPlaybackRate(playback_speed * self.playbackRate)
+
+        self.updateTimer()  # Update the timer based on the new position        
+
+    def findEndSkipIndex(self, start_index):
+        for i in range(start_index, len(self.comments)):
+            _, comment = self.comments[i]
+            if comment == "[":
+                # If another "[" is encountered before finding a "]", return None to ignore it
+                return None
+            elif comment == "]":
+                return i
+        return None
 
     def commentTextChanged(self):
         comment = self.commentEdit.toPlainText()
@@ -306,15 +354,61 @@ class VideoPlayer(QWidget):
         self.positionLabel.setText(self.formatTime(self.mediaPlayer.position()))
 
     def updateOverlay(self):
-        current_position = self.mediaPlayer.position()
-        if len(self.comments) > self.nextCommentIndex:
-            offset, comment = self.comments[self.nextCommentIndex]
-            if offset <= current_position < offset + 5000:  # Comment should be displayed for 5 seconds
-                self.commentOverlay.setText(comment)
-                threading.Thread(target=self.play_speech, args=(comment, 0)).start()
+        position = self.mediaPlayer.position()
+        if self.nextCommentIndex < len(self.comments):
+            nextOffset, nextComment = self.comments[self.nextCommentIndex]
+            difference = nextOffset - position
+
+            # Parsing the comment text for special notation
+            display_text = re.sub(r'\{([^|]+)\|[^}]+\}', r'\1', nextComment)
+            speech_text = re.sub(r'\{[^|]+\|([^}]+)\}', r'\1', nextComment)
+
+
+            # If the difference is within the threshold, handle the comment
+            if difference <= 50:
+                # Check if the comment matches the pattern for fast forward
+                fast_forward_match = re.match(r'^>+(\n)*$', nextComment)
+                slow_down_match = re.match(r'^<+(\n)*$', nextComment)
+                if fast_forward_match:
+                    multiplier = len(fast_forward_match.group(0).replace('\n', ''))
+                    self.playbackScale = multiplier
+                    self.setPlaybackRate(self.playbackRate * multiplier)
+                elif slow_down_match:
+                    divider = len(slow_down_match.group(0).replace('\n', ''))
+                    self.playbackScale = 1.0 / divider
+                    self.setPlaybackRate(self.playbackRate / divider)
+
+                if nextComment == "[":
+                    # Search for the corresponding "]"
+                    end_skip_index = self.findEndSkipIndex(self.nextCommentIndex + 1)
+                    if end_skip_index is not None:
+                        # If found, skip to the end of the skipped zone
+                        self.nextCommentIndex = end_skip_index
+                        self.setPosition(self.comments[end_skip_index][0])
+                        return
+
+                self.commentOverlay.setText(display_text)
+                threading.Thread(target=self.play_speech, args=(speech_text, 0)).start()
                 self.nextCommentIndex += 1
-#        else:
-#            self.commentOverlay.clear()
+                self.updateTimer()
+                
+            # If the difference is within a close range, switch to fine-grained polling
+            elif difference <= 1000:
+                self.overlayTimer.setInterval(50)  # Poll every 50 milliseconds
+            else:
+                self.updateTimer()  # Update the timer interval for the next comment
+        else:
+            self.commentOverlay.clear()
+
+    def updateTimer(self):
+        if self.nextCommentIndex < len(self.comments):
+            position = self.mediaPlayer.position()
+            nextOffset, _ = self.comments[self.nextCommentIndex]
+            # Calculate the difference and set the timer interval
+            difference = max(50, (nextOffset - position) / (self.playbackRate * self.playbackScale) - 50)  # Ensure it's at least 50 milliseconds
+            self.overlayTimer.setInterval(difference)
+        else:
+            self.overlayTimer.setInterval(1000)  # Default to 1-second polling if no more comments
 
     def saveComments(self):
         self.save(self.filename+".comments.json");
@@ -456,3 +550,4 @@ if __name__ == "__main__":
     player.play()
 
     sys.exit(app.exec_())
+#EOF
