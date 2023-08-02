@@ -3,7 +3,7 @@ import json
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
-from moviepy.editor import VideoFileClip, CompositeVideoClip
+from moviepy.editor import VideoFileClip, CompositeVideoClip, VideoClip
 from moviepy.video.VideoClip import ImageClip
 import ffmpeg
 from tqdm import tqdm
@@ -50,6 +50,87 @@ def read_comments(comments_filename):
     with open(comments_filename, 'r') as f:
         comments = json.load(f)
     return comments
+
+def apply_speed_change(clip, comment_text):
+    if re.match(r'^>+(\n)*$', comment_text):
+        speed_multiplier = len(comment_text.strip())
+        return clip.speedx(speed_multiplier)
+    elif re.match(r'^<+(\n)*$', comment_text):
+        speed_divisor = len(comment_text.strip())
+        return clip.speedx(1 / speed_divisor)
+    else:
+        return clip
+
+def parse_comment(comment, use_literal=True):
+    def replacer(match):
+        literal, pronoun = match.groups()
+        return literal if use_literal else pronoun
+
+    return re.sub(r"\{(.+?)\|(.+?)\}", replacer, comment)
+
+def process_video_speed_and_offsets(video, comments):
+    # First pass: create the processed clips and calculate the adjustments
+    processed_clips = []
+    current_speed = 1
+    current_time = 0
+    bracket_level = 0
+    cumulative_adjustment = 0
+    adjustments = []
+
+    for comment in comments:
+        start_ms, text = comment
+        start_s = start_ms / 1000.0
+
+        if text == "[":
+            bracket_level += 1
+            if bracket_level == 2:  # Nested bracket detected, reset bracket level
+                bracket_level = 0
+            continue
+        elif text == "]":
+            bracket_level = max(0, bracket_level - 1)
+            continue
+
+        if bracket_level > 0:  # Inside a bracket, skip this comment
+            continue
+
+        new_speed = apply_speed_multiplier(text, current_speed)
+        if new_speed != current_speed:  # Speed change detected
+            if current_time != start_s:
+                clip = video.subclip(current_time, start_s).speedx(current_speed)
+                print("%f-%f (x%f)"%(current_time, start_s, current_speed))
+                processed_clips.append(clip)
+                clip_duration = start_s - current_time
+                adjustment = (clip_duration / current_speed - clip_duration) * 1000
+                cumulative_adjustment += adjustment
+            current_speed = new_speed
+            current_time = start_s
+        clip_duration = start_s - current_time
+        adjustment = (clip_duration / current_speed - clip_duration) * 1000
+        adjustments.append(cumulative_adjustment + adjustment)
+
+    # Add the remaining part of the video with the last speed change applied
+    processed_clips.append(video.subclip(current_time).speedx(current_speed))
+    print("%f- (x%f)"%(current_time, current_speed))
+
+    # Second pass: apply the adjustments to the comments
+    adjusted_comments = []
+    for i, comment in enumerate(comments):
+        start_ms, text = comment
+        adjustment = adjustments[i]
+        adjusted_comments.append([start_ms + adjustment, text])
+        print("%f-->%f: %s"%(start_ms / 1000, (start_ms + adjustment)/1000, text))
+
+    return concatenate_videoclips(processed_clips), adjusted_comments
+
+
+
+def apply_speed_multiplier(text, current_speed):
+    if re.match(r'^>+(\n)*$', text):
+        return len(text.strip())
+    elif re.match(r'^<+(\n)*$', text):
+        return 1 / len(text.strip())
+    else:
+        return current_speed
 
 def create_text_image(text, width, height):
     image = Image.new('RGBA', (width, height), (0, 0, 0, 0))
@@ -108,13 +189,19 @@ def create_text_image(text, width, height):
     return image
 
 def overlay_text_comments(video_filename, comments):
-    video = VideoFileClip(video_filename, audio=False)  # Remove audio
+    if isinstance(video_filename, str):
+        video = VideoFileClip(video_filename, audio=False)  # Remove audio
+    elif isinstance(video_filename, VideoClip):
+        video = video_filename
+    else:
+        return None
     video_size = video.size
     clips = [video]
 
     for i in range(len(comments)):
         start_ms, text, duration_ms = comments[i]
         start_sec = start_ms / 1000.0  # Convert milliseconds to seconds
+        literal_text = parse_comment(text)  # Use the literal part for overlay text
 
         if i < len(comments) - 1:
             next_start_ms, *_ = comments[i + 1]
@@ -122,7 +209,8 @@ def overlay_text_comments(video_filename, comments):
         else:
             duration = 10
 
-        text_image = create_text_image(text, video_size[0], video_size[1])
+        print("%d: duration=%f sec"%(i, duration))
+        text_image = create_text_image(literal_text, video_size[0], video_size[1])
         txt_clip = (ImageClip(text_image, duration=duration).set_start(start_sec))
         clips.append(txt_clip)
 
@@ -176,7 +264,8 @@ def generate_wav(filename, comments, audioSpeedScale, speaker = 0):
     for comment in tqdm(sorted(comments, key=lambda x: x[0])):
         text = comment[1]
         text = alpha_to_kana(text)
-        res1 = requests.post("http://localhost:50021/audio_query", params={"text": text, "speaker": speaker})
+        pronoun_text = parse_comment(text, use_literal=False) # Use the pronoun part for play_speech
+        res1 = requests.post("http://localhost:50021/audio_query", params={"text": pronoun_text if pronoun_text else text, "speaker": speaker})
         data = res1.json()
         if "speedScale" in data:
             data["speedScale"] *= audioSpeedScale
@@ -201,33 +290,32 @@ def generate_wav(filename, comments, audioSpeedScale, speaker = 0):
     mixdown_audio.export(output_filename, format="wav")
     return output_filename
 
-
 def main():
-    video_filename = sys.argv[1]  # Get source video filename from command line arguments
-
-    # Read comments data
+    video_filename = sys.argv[1]
     comments_filename = video_filename + ".comments.json"
     comments = read_comments(comments_filename)
     audioSpeedScale = float(sys.argv[3]) if len(sys.argv) > 3 and float(sys.argv[3]) else 1.0
 
-    if len(sys.argv) > 2 and sys.argv[2] == '--preview':
-        # Generate audio comments
-        audio_comments_filename = generate_wav(video_filename, comments, audioSpeedScale)
-
-        # Show a preview instead of generating final video
-        preview_video(comments, video_filename, audio_comments_filename)
-    elif len(sys.argv) > 2 and sys.argv[2] == '--audio':
+    if len(sys.argv) > 2 and sys.argv[2] == '--audio':
         text_overlay_video_filename = video_filename[:-4] + "_text_overlay.mp4"        
         audio_comments_filename = video_filename + ".comments.wav"
         # Combine video with overlay text and audio comments
         output_filename = video_filename[:-4] + "_final.mp4"
         add_audio_comments(text_overlay_video_filename, audio_comments_filename, output_filename)
+
     else:
-        # Generate audio comments
-        audio_comments_filename = generate_wav(video_filename, comments, audioSpeedScale)
-        output_filename = video_filename[:-4] + "_final.mp4"
-        generate_video(comments, video_filename, audio_comments_filename, output_filename)
+        video = VideoFileClip(video_filename, audio=False)
+
+        # Apply the speed changes and offset updates
+        processed_video, updated_comments = process_video_speed_and_offsets(video, comments)
+
+        if len(sys.argv) > 2 and sys.argv[2] == '--preview':
+            audio_comments_filename = generate_wav(video_filename, updated_comments, audioSpeedScale)
+            preview_video(updated_comments, processed_video, audio_comments_filename)
+        else:
+            audio_comments_filename = generate_wav(video_filename, updated_comments, audioSpeedScale)
+            output_filename = video_filename[:-4] + "_final.mp4"
+            generate_video(updated_comments, processed_video, audio_comments_filename, output_filename)
 
 if __name__ == "__main__":
     main()
-
