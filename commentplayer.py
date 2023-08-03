@@ -1,27 +1,17 @@
 import sys
-from PySide2.QtCore import Qt, QUrl, QTimer, Signal, QIODevice, QByteArray
-from PySide2.QtGui import QTextCursor, QCloseEvent, QPixmap, QKeyEvent,  QInputMethodEvent
-from PySide2.QtMultimedia import QMediaContent, QMediaPlayer
-from PySide2.QtMultimediaWidgets import QVideoWidget
+from PySide2.QtCore import Qt, QUrl, QTimer, Signal, QIODevice, QByteArray, QPoint
+from PySide2.QtGui import QTextCursor, QCloseEvent, QPixmap, QKeyEvent,  QInputMethodEvent, QColor, QBrush
+from PySide2.QtMultimedia import QMediaContent, QMediaPlayer, QAbstractVideoBuffer
+from PySide2.QtMultimediaWidgets import QVideoWidget, QGraphicsVideoItem
 from PySide2.QtWidgets import (QApplication, QSlider, QVBoxLayout, QWidget,
                                QTextEdit, QTableWidget, QTableWidgetItem, QHBoxLayout, QLabel, QPushButton,
-                               QToolButton, QAbstractItemView, QLineEdit)
+                               QToolButton, QAbstractItemView, QLineEdit, QTabWidget, QStyledItemDelegate)
 from PySide2.QtWidgets import QSizePolicy
+from PySide2.QtGui import QPainter, QPen, QPixmap
+from PySide2.QtWidgets import QGraphicsView, QGraphicsScene
 
-import requests, threading
-import qtawesome as qta
-import json
-import tempfile
-
-import MeCab
-import unidic
-import pandas as pd
-import alkana
-import re
-import os
-import tqdm
+import requests, threading, json, tempfile, MeCab, unidic, pandas as pd, alkana, re, os, tqdm, qtawesome as qta, io, wave
 from pydub import AudioSegment
-import io, wave
 
 # Global variable for the hostname of the VOICEVOX server
 VOICEVOX_SERVER = "http://localhost:50021"
@@ -51,6 +41,14 @@ def alpha_to_kana(text):
         sample_txt = sample_txt.replace(word, read or "")
     return sample_txt
 
+class ThumbnailDelegate(QStyledItemDelegate):
+    def paint(self, painter, option, index):
+        if index.column() == 1:
+            thumbnail = index.data(Qt.DecorationRole)
+            if thumbnail:
+                painter.drawPixmap(option.rect.x(), option.rect.y(), thumbnail)
+        else:
+            super().paint(painter, option, index)
 
 class IMETextEdit(QTextEdit):
     editingStarted = Signal()
@@ -72,26 +70,50 @@ class VideoPlayer(QWidget):
         self.filename = filename
         self.playbackRate = playbackRate
         self.playbackScale = 1.0
+        self.trajectory = []  # To store the trajectory [(time, x, y), ...]
+        self.clear_events = []  # To store the times of right-click clear events
 
         self.mediaPlayer = QMediaPlayer(None, QMediaPlayer.VideoSurface)
         self.voicePlayer = QMediaPlayer()
-        self.videoWidget = QVideoWidget()
+
+        # Create a QGraphicsView for drawing the trajectory
+        self.graphicsScene = QGraphicsScene()
+        self.graphicsView = QGraphicsView(self.graphicsScene)
+        self.drawnItems = []
+        self.graphicsView.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.graphicsView.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        self.videoWidget = QGraphicsVideoItem() #QVideoWidget()
+        self.graphicsScene.addItem(self.videoWidget)
         self.slider = QSlider(Qt.Horizontal)
         self.playButton  = QToolButton()
         self.commentEdit = IMETextEdit()
         self.commentsTable = QTableWidget(0, 3)
+        self.tabWidget = QTabWidget()
+
+        # Trajectory Table
+        self.trajectoryTable = QTableWidget()
+        self.trajectoryTable.setColumnCount(3)
+        self.trajectoryTable.setHorizontalHeaderLabels(['Offset Time', 'Thumbnail', 'Remove'])
+        self.trajectoryTable.setItemDelegate(ThumbnailDelegate())
+        self.trajectoryTable.clicked.connect(self.selectTrajectory)  # CHANGE HERE
+
+        # Add tabs
+        self.tabWidget.addTab(self.commentsTable, "Comments")
+        self.tabWidget.addTab(self.trajectoryTable, "Trajectory")
+
         self.loadingLabel = QLabel()
         self.positionLabel = QLabel("00:00:00")
         self.editPositionLabel = QLabel()
         self.saveButton = QPushButton("Save")
         self.loadButton = QPushButton("Load")
-        self.generateWavButton = QPushButton("export WAV")
         
         self.commentOverlay = QLabel()
         self.commentOverlay.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
 
         videoLayout = QVBoxLayout()
-        videoLayout.addWidget(self.videoWidget)
+#        videoLayout.addWidget(self.videoWidget)
+        videoLayout.addWidget(self.graphicsView)
         videoLayout.addWidget(self.commentOverlay)
         videoMenuLayout = QHBoxLayout()
         videoLayout.addLayout(videoMenuLayout)
@@ -100,11 +122,10 @@ class VideoPlayer(QWidget):
         videoMenuLayout.addWidget(self.playButton)
 
         commentLayout = QVBoxLayout()
-        commentLayout.addWidget(self.commentsTable)
+        commentLayout.addWidget(self.tabWidget)
         buttonLayout = QHBoxLayout();
         buttonLayout.addWidget(self.saveButton)
         buttonLayout.addWidget(self.loadButton)
-        buttonLayout.addWidget(self.generateWavButton)
         commentLayout.addLayout(buttonLayout)
         commentLayout.addWidget(QLabel("Comment:"))
         commentLayout.addWidget(self.loadingLabel)
@@ -114,6 +135,14 @@ class VideoPlayer(QWidget):
         self.editOffset.returnPressed.connect(self.updateOffset)  # CHANGE HERE
         commentLayout.addWidget(self.editOffset)  # CHANGE HERE
         commentLayout.addWidget(self.commentEdit)
+
+        self.tabWidget.setMaximumSize(480, 1500)
+        self.tabWidget.setMinimumSize(480, 480)
+        self.commentEdit.setMaximumSize(480, 320)
+        self.commentEdit.setMinimumSize(480, 320)
+        self.graphicsView.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.commentEdit.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        self.commentsTable.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
         layout = QHBoxLayout()
         layout.addLayout(videoLayout)
@@ -136,7 +165,6 @@ class VideoPlayer(QWidget):
 
         self.saveButton.clicked.connect(self.saveComments)
         self.loadButton.clicked.connect(self.loadComments)
-        self.generateWavButton.clicked.connect(self.generateWav)
 
         self.playButton.setIcon(qta.icon('fa5s.play'))
 
@@ -167,10 +195,26 @@ class VideoPlayer(QWidget):
         # Set up the loading icon
         self.loadingIcon = qta.icon('fa.spinner', color='red', animation=qta.Spin(self.commentEdit))
 
+        # Timer to update the trajectory overlay
+        self.trajectoryTimer = QTimer(self)
+        self.trajectoryTimer.setInterval(50)  # Update at approximately 60 FPS
+        self.trajectoryTimer.timeout.connect(self.updateTrajectoryOverlay)
+        self.trajectoryTimer.start()
+
+        # Enable mouse tracking
+        self.graphicsView.setMouseTracking(True)
+        self.graphicsView.mousePressEvent = self.mousePressEvent
+        self.graphicsView.mouseMoveEvent = self.mouseMoveEvent
+        self.graphicsView.mouseReleaseEvent = self.mouseReleaseEvent
+
         self.loadComments()
         self.updateTimer()  # Initialize the timer for the first comment
         self.setPlaybackRate(playbackRate)
+        self.updateTrajectoryTable()
 
+    def resizeEvent(self, event):
+        self.videoWidget.setSize(self.graphicsView.size())
+        self.graphicsView.fitInView(self.videoWidget, Qt.KeepAspectRatio)
 
     def tableItemChanged(self, item):
         # item is the QTableWidgetItem that was changed
@@ -252,7 +296,6 @@ class VideoPlayer(QWidget):
         self.playbackScale = playback_speed
         
         # Update the playback rate if a valid speed was found
-        print("playbackScale=%f,%f"%(self.playbackScale, self.playbackRate))
         self.setPlaybackRate(playback_speed * self.playbackRate)
 
         self.updateTimer()  # Update the timer based on the new position        
@@ -344,12 +387,6 @@ class VideoPlayer(QWidget):
     def play(self):
         self.mediaPlayer.play()
 
-    def formatTime(self, ms):
-        s = ms // 1000
-        m, s = divmod(s, 60)
-        h, m = divmod(m, 60)
-        return "%02d:%02d:%02d" % (h, m, s)
-
     def updatePositionLabel(self):
         self.positionLabel.setText(self.formatTime(self.mediaPlayer.position()))
 
@@ -410,58 +447,6 @@ class VideoPlayer(QWidget):
         else:
             self.overlayTimer.setInterval(1000)  # Default to 1-second polling if no more comments
 
-    def saveComments(self):
-        self.save(self.filename+".comments.json");
-
-    def save(self, filename):
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(self.comments, f, ensure_ascii=False, indent=2)
-    
-    def loadComments(self):
-        self.load(self.filename+".comments.json")
-
-    def load(self, filename):
-        comments = []
-        try:
-            with open(filename, "r") as f:
-                comments = json.load(f)
-            self.comments = []
-            while self.commentsTable.rowCount() > 0:
-                self.commentsTable.removeRow(0)
-            for offset, comment in comments:
-                self.addComment(comment, offset)
-        except FileNotFoundError as e:
-            pass
-
-    def generateWav(self):
-        threading.Thread(target=self.generate_wav, args=(0,)).start()
-
-    def play_speech(self, text, speaker=0):
-        text = alpha_to_kana(text)
-        res1 = requests.post("http://localhost:50021/audio_query", params={"text": text, "speaker": speaker})
-        data = res1.json()
-        if "speedScale" in data:
-            data["speedScale"] *= audioSpeedRate
-        wav_res = requests.post("http://localhost:50021/synthesis", params={"speaker": speaker}, json=data)
-        wav_data = wav_res.content
-
-        self.play_voice(wav_data)
-    
-    def play_voice(self, wave_data):
-        # Create a temporary file
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        temp_file.write(wave_data)
-        temp_file.close()
-
-        # Play the temporary file
-        if self.voicePlayer is None:
-            self.voicePlayer = QMediaPlayer()
-        self.voicePlayer.setMedia(QMediaContent(QUrl.fromLocalFile(temp_file.name)))
-        self.voicePlayer.play()
-        
-        # Delete the temporary file after playing
-        os.unlink(temp_file.name)
-
     def selectComment(self, index):  # CHANGE HERE
         row = index.row()
         offset, comment = self.comments[row]
@@ -497,40 +482,202 @@ class VideoPlayer(QWidget):
         self.editOffset.hide()
         self.editPositionLabel.show()
 
+    def formatTime(self, ms):
+        s = ms // 1000
+        m, s = divmod(s, 60)
+        h, m = divmod(m, 60)
+        return "%02d:%02d:%02d" % (h, m, s)
+
+    def saveComments(self):
+        self.save(self.filename+".comments.json");
+
+    def save(self, filename):
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump({"comments": self.comments, "trajectory": self.trajectory, "clear": self.clear_events}, f, ensure_ascii=False, indent=2)
+    
+    def loadComments(self):
+        self.load(self.filename+".comments.json")
+
+    def load(self, filename):
+        comments = []
+        try:
+            with open(filename, "r") as f:
+                comments = json.load(f)
+                if isinstance(comments, dict):
+                    self.trajectory = comments["trajectory"]
+                    self.clear_events = comments["clear"]
+                    comments = comments["comments"]
+            self.comments = []
+            while self.commentsTable.rowCount() > 0:
+                self.commentsTable.removeRow(0)
+            for offset, comment in comments:
+                self.addComment(comment, offset)
+        except FileNotFoundError as e:
+            pass
+
+    def play_speech(self, text, speaker=0):
+        text = alpha_to_kana(text)
+        res1 = requests.post("http://localhost:50021/audio_query", params={"text": text, "speaker": speaker})
+        data = res1.json()
+        if "speedScale" in data:
+            data["speedScale"] *= audioSpeedRate
+        wav_res = requests.post("http://localhost:50021/synthesis", params={"speaker": speaker}, json=data)
+        wav_data = wav_res.content
+
+        self.play_voice(wav_data)
+    
+    def play_voice(self, wave_data):
+        # Create a temporary file
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        temp_file.write(wave_data)
+        temp_file.close()
+
+        # Play the temporary file
+        if self.voicePlayer is None:
+            self.voicePlayer = QMediaPlayer()
+        self.voicePlayer.setMedia(QMediaContent(QUrl.fromLocalFile(temp_file.name)))
+        self.voicePlayer.play()
+        
+        # Delete the temporary file after playing
+        os.unlink(temp_file.name)
+
     def timeToMs(self, timeStr):  # CHANGE HERE
         h, m, s = map(float, timeStr.split(":"))
         return int((h * 60 * 60 + m * 60 + s) * 1000)
 
-    def generate_wav(self, speaker = 0):
-        # Create an empty audio track of silence for mixdown
-        mixdown_audio = AudioSegment.silent(duration=0)
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.start_press_time = self.mediaPlayer.position()
+            # Start recording the trajectory
+            offset = QPoint(self.videoWidget.offset().x() + self.videoWidget.size().width() / 2, self.videoWidget.offset().y() + self.videoWidget.size().height() / 2)
+            size_w = self.videoWidget.size().width() / self.videoWidget.nativeSize().width()
+            size_h = self.videoWidget.size().height() / self.videoWidget.nativeSize().height()
+            scale = self.videoWidget.size().height() if size_w > size_h else self.videoWidget.size().width()
+            self.trajectory.append((self.start_press_time, self.mediaPlayer.position(), float(event.pos().x() - offset.x()) / scale, float(event.pos().y() - offset.y()) / scale))
+            self.trajectory.sort(key = lambda a: a[0])
+        elif event.button() == Qt.RightButton:
+            # Clear the trajectory and record the time
+            self.clear_events.append(self.mediaPlayer.position())
+            self.clear_events.sort()
 
-        # Iterate over the sorted comments
-        for comment in tqdm.tqdm(sorted(self.comments, key=lambda x: x[0])):
-            text = comment[1]
-            text = alpha_to_kana(text)
-            res1 = requests.post("http://localhost:50021/audio_query", params={"text": text, "speaker": speaker})
-            data = res1.json()
-            if "speedScale" in data:
-                data["speedScale"] *= self.audioSpeedScale
-            wav_res = requests.post("http://localhost:50021/synthesis", params={"speaker": speaker}, json=data)
-            wav_data = wav_res.content
-            
-            # Load the wav_data into an AudioSegment
-            audio_segment = AudioSegment.from_wav(io.BytesIO(wav_data))
-            
-            # If the audio_segment is shorter than the comment[0] offset, pad it with silence
-            audio_duration_ms = len(audio_segment)
-            silence_duration_ms = max(0, comment[0] - len(mixdown_audio))
-            silence = AudioSegment.silent(duration=silence_duration_ms)
-            
-            # Append silence and audio_segment to mixdown_audio
-            mixdown_audio += silence
-            mixdown_audio += audio_segment
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.LeftButton:
+            # Continue recording the trajectory
+            offset = QPoint(self.videoWidget.offset().x() + self.videoWidget.size().width() / 2, self.videoWidget.offset().y() + self.videoWidget.size().height() / 2)
+            size_w = self.videoWidget.size().width() / self.videoWidget.nativeSize().width()
+            size_h = self.videoWidget.size().height() / self.videoWidget.nativeSize().height()
+            scale = self.videoWidget.size().height() if size_w > size_h else self.videoWidget.size().width()
+            self.trajectory.append((self.start_press_time, self.mediaPlayer.position(), float(event.pos().x() - offset.x()) / scale, float(event.pos().y() - offset.y()) / scale))
+            self.trajectory.sort(key = lambda a: a[0])
 
-        # Export the mixdown_audio to a .wav file
-        output_filename = self.filename + ".comments.wav"
-        mixdown_audio.export(output_filename, format="wav")
+    def mouseReleaseEvent(self, event):
+        self.start_press_time = None
+        self.updateTrajectoryTable()
+
+    def updateTrajectoryOverlay(self):
+        # Clear the previous drawing
+#        self.graphicsScene.clear()
+
+        # Get the current playback position
+        position = self.mediaPlayer.position()
+
+        # Set the pen for drawing
+        pen = QPen(Qt.red, 3)  # Set pen color and thickness
+
+        for i in self.drawnItems:
+            self.graphicsScene.removeItem(i)
+        self.drawnItems = []
+
+        # Draw the trajectory up to the current position
+        for i in range(1, len(self.trajectory)):
+            prev_start_press_time, prev_time, prev_x, prev_y = self.trajectory[i - 1]
+            start_press_time, curr_time, curr_x, curr_y = self.trajectory[i]
+            offset = QPoint(self.videoWidget.offset().x() + self.videoWidget.size().width() / 2, self.videoWidget.offset().y() + self.videoWidget.size().height() / 2)
+            size_w = self.videoWidget.size().width() / self.videoWidget.nativeSize().width()
+            size_h = self.videoWidget.size().height() / self.videoWidget.nativeSize().height()
+            scale = self.videoWidget.size().height() if size_w > size_h else self.videoWidget.size().width()
+            prev_x *= scale
+            prev_y *= scale
+            curr_x *= scale
+            curr_y *= scale
+            if prev_start_press_time != start_press_time or start_press_time is None:
+                continue
+
+            if curr_time > position:
+                break
+
+            if any(curr_time <= clear_time and clear_time < position for clear_time in self.clear_events):
+                continue
+
+            self.drawnItems.append(self.graphicsScene.addLine(prev_x + offset.x(), prev_y + offset.y(), curr_x + offset.x(), curr_y + offset.y(), pen))
+
+        self.graphicsView.setScene(self.graphicsScene)
+
+    def updateTrajectoryTable(self):
+        self.trajectoryTable.clear()
+        thumbnails = self.createThumbnails()
+        self.trajectoryTable.setRowCount(len(thumbnails))
+        for row, (start_time, thumbnail, clear_time) in enumerate(thumbnails):
+            time_item = QTableWidgetItem(self.formatTime(start_time))
+            time_item.setData(Qt.UserRole, clear_time) # Store only clear_time
+            self.trajectoryTable.setItem(row, 0, time_item)
+
+            thumbnail_item = QTableWidgetItem()
+            thumbnail_item.setData(Qt.DecorationRole, thumbnail)
+            self.trajectoryTable.setItem(row, 1, thumbnail_item)
+
+            remove_button = QPushButton('Remove')
+            remove_function = (lambda r: lambda: self.removeTrajectoryRow(r))(row)  # Closure to capture the row value
+            remove_button.clicked.connect(remove_function)
+            self.trajectoryTable.setCellWidget(row, 2, remove_button)
+
+            self.trajectoryTable.setRowHeight(row, thumbnail.height())  # Set the row height to match the thumbnail
+
+    def createThumbnails(self):
+        thumbnails = []
+        start_index = 0
+
+        for clear_time in self.clear_events:
+            thumbnail = QPixmap(80, 60)
+            thumbnail.fill(Qt.white)  # Fill the thumbnail with a white background
+            painter = QPainter(thumbnail)
+            painter.setPen(QColor(Qt.red))  # Set the pen color to red
+
+            for i in range(start_index, len(self.trajectory) - 1):
+                if self.trajectory[i][1] < clear_time:
+                    if self.trajectory[i][0] != self.trajectory[i+1][0]:
+                        continue
+                    x1 = (self.trajectory[i][2] + 1) / 2 * thumbnail.width()
+                    y1 = (self.trajectory[i][3] + 1) / 2 * thumbnail.height()
+                    x2 = (self.trajectory[i + 1][2] + 1) / 2 * thumbnail.width()
+                    y2 = (self.trajectory[i + 1][3] + 1) / 2 * thumbnail.height()
+                    painter.drawLine(x1, y1, x2, y2)
+                else:
+                    start_index = i
+                    break
+
+            painter.end()
+            thumbnails.append((self.trajectory[start_index][0], thumbnail, clear_time))
+
+        return thumbnails
+
+    def selectTrajectory(self, index):  # CHANGE HERE
+        row = index.row()
+        clear_time = self.clear_events[row - 1] if row > 0 else 0
+        for t in self.trajectory:
+            if t[0] >= clear_time:
+                self.setPosition(t[0] - 2000)
+                break
+
+    def removeTrajectoryRow(self, row):
+        clear_time = self.trajectoryTable.item(row, 0).data(Qt.UserRole)
+        clear_index = self.clear_events.index(clear_time)
+        start_time = self.clear_events[clear_index - 1] if clear_index > 0 else 0
+        
+        self.trajectory = [t for t in self.trajectory if not (start_time <= t[1] < clear_time)]
+        self.clear_events.remove(clear_time)
+        self.trajectoryTable.removeRow(row)
+        self.updateTrajectoryTable()
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
