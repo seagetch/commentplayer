@@ -46,10 +46,47 @@ def alpha_to_kana(text):
 
 TTF_FONTFILE='/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc'
 
+def draw_trajectory(frame, current_time, trajectory, clear_events):
+    img = Image.fromarray(frame)
+    draw = ImageDraw.Draw(img)
+
+    # Clear all existing trajectories if the current time matches any of the clear_events
+    already_clipped = [clear_time for clear_time in clear_events if clear_time < current_time * 1000]
+    last_clipped = max(already_clipped) if len(already_clipped) > 0 else -1
+
+    # Draw the trajectory
+    for i, item in enumerate(trajectory):
+        start_time, draw_time, x, y = item
+        prev_start_time, prev_time, prev_x, prev_y = trajectory[i - 1] if i > 0 else [-1, 0, 0, 0]
+        x = x * img.width + img.width / 2
+        y = y * img.width + img.height / 2
+        prev_x = prev_x * img.width + img.width / 2
+        prev_y = prev_y * img.width + img.height / 2
+        if prev_start_time != start_time:
+            continue
+        if last_clipped < draw_time and draw_time <= current_time * 1000:
+            draw.line((prev_x, prev_y, x, y), fill="red", width=3)
+
+    return np.array(img)
+
+def compose_video_with_trajectory(video, trajectory, clear_events):
+    def process_frame(get_frame, t):
+        frame = get_frame(t)
+        return draw_trajectory(frame, t, trajectory, clear_events)
+
+    new_video = video.fl(lambda gf, t: process_frame(gf, t), apply_to=['mask', 'video'])
+    return new_video
+    
 def read_comments(comments_filename):
+    trajectory = []
+    clear_events = []
     with open(comments_filename, 'r') as f:
         comments = json.load(f)
-    return comments
+        if isinstance(comments, dict):
+            trajectory = comments["trajectory"]
+            clear_events = comments["clear"]
+            comments = comments["comments"]
+    return comments, trajectory, clear_events
 
 def apply_speed_change(clip, comment_text):
     if re.match(r'^>+(\n)*$', comment_text):
@@ -67,7 +104,7 @@ def parse_comment(comment, use_literal=True):
         return literal if use_literal else pronoun
 
     return re.sub(r"\{(.+?)\|(.+?)\}", replacer, comment)
-
+    
 def process_video_speed_and_offsets(video, comments):
     # First pass: create the processed clips and calculate the adjustments
     processed_clips = []
@@ -85,12 +122,15 @@ def process_video_speed_and_offsets(video, comments):
             bracket_level += 1
             if bracket_level == 2:  # Nested bracket detected, reset bracket level
                 bracket_level = 0
+            adjustments.append(cumulative_adjustment)
             continue
         elif text == "]":
             bracket_level = max(0, bracket_level - 1)
+            adjustments.append(cumulative_adjustment)
             continue
 
         if bracket_level > 0:  # Inside a bracket, skip this comment
+            adjustments.append(cumulative_adjustment)
             continue
 
         new_speed = apply_speed_multiplier(text, current_speed)
@@ -293,7 +333,8 @@ def generate_wav(filename, comments, audioSpeedScale, speaker = 0):
 def main():
     video_filename = sys.argv[1]
     comments_filename = video_filename + ".comments.json"
-    comments = read_comments(comments_filename)
+    comments, trajectory, clear_events = read_comments(comments_filename)
+#    comments = comments[0:3]
     audioSpeedScale = float(sys.argv[3]) if len(sys.argv) > 3 and float(sys.argv[3]) else 1.0
 
     if len(sys.argv) > 2 and sys.argv[2] == '--audio':
@@ -305,9 +346,9 @@ def main():
 
     else:
         video = VideoFileClip(video_filename, audio=False)
+        video_with_trajectory = compose_video_with_trajectory(video, trajectory, clear_events)
 
-        # Apply the speed changes and offset updates
-        processed_video, updated_comments = process_video_speed_and_offsets(video, comments)
+        processed_video, updated_comments = process_video_speed_and_offsets(video_with_trajectory, comments)
 
         if len(sys.argv) > 2 and sys.argv[2] == '--preview':
             audio_comments_filename = generate_wav(video_filename, updated_comments, audioSpeedScale)
