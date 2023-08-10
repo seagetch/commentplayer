@@ -1,0 +1,11 @@
+PySide2
+requests
+tempfile
+MeCab
+unidic
+pandas
+alkana
+re
+tqdm
+qtawesome
+pydub
