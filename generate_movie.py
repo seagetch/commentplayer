@@ -172,9 +172,8 @@ def apply_speed_multiplier(text, current_speed):
 	else:
 		return current_speed
 
-def create_text_image(text, width, height):
+def create_text_image(text, width, height, font):
 	image = Image.new('RGBA', (width, height), (0, 0, 0, 0))
-	font = ImageFont.truetype(TTF_FONTFILE, 50)
 	draw = ImageDraw.Draw(image)
 	max_width = width
 	wrapped_text = ""
@@ -229,6 +228,7 @@ def create_text_image(text, width, height):
 	return image
 
 def overlay_text_comments(video_filename, comments):
+	font = ImageFont.truetype(TTF_FONTFILE, 50)
 	if isinstance(video_filename, str):
 		video = VideoFileClip(video_filename, audio=False)  # Remove audio
 	elif isinstance(video_filename, VideoClip):
@@ -250,7 +250,7 @@ def overlay_text_comments(video_filename, comments):
 			duration = 10
 
 		print("%d: duration=%f sec"%(i, duration))
-		text_image = create_text_image(literal_text, video_size[0], video_size[1])
+		text_image = create_text_image(literal_text, video_size[0], video_size[1], font		)
 		txt_clip = (ImageClip(text_image, duration=duration).set_start(start_sec))
 		clips.append(txt_clip)
 
@@ -296,40 +296,53 @@ def generate_video(comments, video_filename, audio_comments_filename, final_file
 	final_video.write_videofile(final_filename, codec='libx264')
 
 	
-def generate_wav(filename, comments, audioSpeedScale, speaker = 0):
-	# Create an empty audio track of silence for mixdown
-	mixdown_audio = AudioSegment.silent(duration=0)
+def generate_wav(filename, comments, audioSpeedScale, speaker=0):
+    # Create an empty audio track of silence for mixdown
+    mixdown_audio = AudioSegment.silent(duration=0)
+    # List to store segmented comments
+    segmented_comments = []
 
-	# Iterate over the sorted comments
-	for comment in tqdm(sorted(comments, key=lambda x: x[0])):
-		text = comment[1]
-		text = alpha_to_kana(text)
-		pronoun_text = parse_comment(text, use_literal=False) # Use the pronoun part for play_speech
-		res1 = requests.post("http://localhost:50021/audio_query", params={"text": pronoun_text if pronoun_text else text, "speaker": speaker})
-		data = res1.json()
-		if "speedScale" in data:
-			data["speedScale"] *= audioSpeedScale
-		wav_res = requests.post("http://localhost:50021/synthesis", params={"speaker": speaker}, json=data)
-		wav_data = wav_res.content
-		
-		# Load the wav_data into an AudioSegment
-		audio_segment = AudioSegment.from_wav(io.BytesIO(wav_data))
-		
-		# If the audio_segment is shorter than the comment[0] offset, pad it with silence
-		audio_duration_ms = len(audio_segment)
-		silence_duration_ms = max(0, comment[0] - len(mixdown_audio))
-		silence = AudioSegment.silent(duration=silence_duration_ms)
-		comment.append(audio_duration_ms)
-		
-		# Append silence and audio_segment to mixdown_audio
-		mixdown_audio += silence
-		mixdown_audio += audio_segment
+    # Iterate over the sorted comments
+    for comment in tqdm(sorted(comments, key=lambda x: x[0])):
+        start_time, text = comment
+        # Calculate silence duration and insert it if necessary
+        silence_duration_ms = max(0, start_time - len(mixdown_audio))
+        silence = AudioSegment.silent(duration=silence_duration_ms)
+        mixdown_audio += silence
 
-	# Export the mixdown_audio to a .wav file
-	output_filename = filename + ".comments.wav"
-	mixdown_audio.export(output_filename, format="wav")
-	return output_filename
+        # Split the comment text by '---' and process each segment separately
+        segments = text.split('---')
+        for segment in segments:
+            if len(segment.strip()) == 0:
+                continue
+            # Convert text, generate audio data, and load it into an AudioSegment
+            kana_segment = alpha_to_kana(segment)
+            pronoun_segment = parse_comment(kana_segment, use_literal=False)
+            res1 = requests.post("http://localhost:50021/audio_query", params={"text": pronoun_segment if pronoun_segment else segment, "speaker": speaker})
+            data = res1.json()
+            if "speedScale" in data:
+                data["speedScale"] *= audioSpeedScale
+            wav_res = requests.post("http://localhost:50021/synthesis", params={"speaker": speaker}, json=data)
+            wav_data = wav_res.content
+            audio_segment = AudioSegment.from_wav(io.BytesIO(wav_data))
 
+            # Append the audio_segment to the mixdown_audio
+            mixdown_audio += audio_segment
+
+            segment = parse_comment(segment, use_literal=True)
+            # Add the segmented comment with start time, text, and duration
+            audio_duration_ms = len(audio_segment)
+            segmented_comments.append([start_time, segment, audio_duration_ms])
+
+            # Update the start_time for the next segment
+            start_time += audio_duration_ms
+
+    # Export the mixdown_audio to a .wav file with the updated filename
+    output_filename = filename + ".comments.wav"
+    mixdown_audio.export(output_filename, format="wav")
+
+    return segmented_comments, output_filename
+		
 def main():
 	video_filename = sys.argv[1]
 	comments_filename = video_filename + ".comments.json"
@@ -351,10 +364,10 @@ def main():
 		processed_video, updated_comments = process_video_speed_and_offsets(video_with_trajectory, comments)
 
 		if len(sys.argv) > 2 and sys.argv[2] == '--preview':
-			audio_comments_filename = generate_wav(video_filename, updated_comments, audioSpeedScale)
+			updated_comments, audio_comments_filename = generate_wav(video_filename, updated_comments, audioSpeedScale)
 			preview_video(updated_comments, processed_video, audio_comments_filename)
 		else:
-			audio_comments_filename = generate_wav(video_filename, updated_comments, audioSpeedScale)
+			updated_comments, audio_comments_filename = generate_wav(video_filename, updated_comments, audioSpeedScale)
 			output_filename = video_filename[:-4] + "_final.mp4"
 			generate_video(updated_comments, processed_video, audio_comments_filename, output_filename)
 
